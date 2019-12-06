@@ -6,12 +6,12 @@ import (
 	"io"
 )
 
-type EmbedConf struct {
+type Embedder struct {
 	Head  func(wordc, dimen int) error
 	Embed func(token string, embeddings []float32) error
 }
 
-func (cfg EmbedConf) EmbedBin(istrm io.Reader) (err error) {
+func (cfg Embedder) EmbedBin(istrm io.Reader) (err error) {
 	var (
 		wordc, dimen int
 		t            string
@@ -28,6 +28,9 @@ func (cfg EmbedConf) EmbedBin(istrm io.Reader) (err error) {
 	for i := 0; i < wordc; i++ {
 		_, err = fmt.Fscanf(istrm, "%s", &t)
 		if err != nil {
+            if err == io.EOF {
+                err = nil
+            }
 			return
 		}
 		embedding := make([]float32, dimen)
@@ -44,7 +47,7 @@ func (cfg EmbedConf) EmbedBin(istrm io.Reader) (err error) {
 	return
 }
 
-func (cfg EmbedConf) EmbedText(istrm io.Reader) (err error) {
+func (cfg Embedder) EmbedText(istrm io.Reader) (err error) {
 	var (
 		wordc, dimen int
 		t            string
@@ -59,7 +62,13 @@ func (cfg EmbedConf) EmbedText(istrm io.Reader) (err error) {
 		}
 	}
 	for i := 0; i < wordc; i++ {
-		fmt.Fscanf(istrm, "%s", &t)
+		_, err = fmt.Fscanf(istrm, "%s", &t)
+        if err != nil {
+            if err == io.EOF {
+                err = nil
+            }
+            return
+        }
 		embedding := make([]float32, dimen)
 		for b := 0; b < dimen; b++ {
 			_, err = fmt.Fscanf(istrm, "%f", &embedding[b])
