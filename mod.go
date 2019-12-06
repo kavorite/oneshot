@@ -1,21 +1,24 @@
 package main
 
 import (
-    "math"
-    "fmt"
-    "flag"
-    "strings"
-	"gonum.org/v1/gonum/mat"
-    "github.com/james-bowman/sparse"
-    "io"
-	"github.com/kavorite/induction/word2vec"
-    "gopkg.in/jdkato/prose.v2"
-	"os"
     "encoding/binary"
-    "sort")
+    "flag"
+    "fmt"
+    "io"
+    "math"
+    "os"
+    "sort"
+    "strings"
+    "bufio"
+
+    "github.com/james-bowman/sparse"
+    "github.com/kavorite/induction/word2vec"
+    "gonum.org/v1/gonum/mat"
+    "gopkg.in/jdkato/prose.v2"
+)
 
 var (
-    windowSize int
+    windowSize                       int
     corpusPath, embeddingPath, opath string
 )
 
@@ -26,16 +29,14 @@ func cos(u, v mat.Vector) float64 {
 type embeddings struct {
     *mat.Dense
     Tokens []string
-    Vocab map[string]int
+    Vocab  map[string]int
 }
 
-func (eb embeddings) embed(t string) mat.Vector {
+func (eb embeddings) embed(t string) (v mat.Vector) {
     if i, ok := eb.Vocab[t]; ok {
-        v := eb.RawRowView(i)
-        return mat.NewVecDense(len(v), v)
-    } else {
-        return nil
+        v = eb.RowView(i)
     }
+    return
 }
 
 func readEmbeddings(path string) (rtn embeddings, err error) {
@@ -44,14 +45,14 @@ func readEmbeddings(path string) (rtn embeddings, err error) {
         return
     }
     i := 0
-    embedder := word2vec.Embedder {
-		Head: func(wordc, dimen int) error {
-			rtn.Dense = mat.NewDense(wordc, dimen, nil)
+    embedder := word2vec.Embedder{
+        Head: func(wordc, dimen int) error {
+            rtn.Dense = mat.NewDense(wordc, dimen, nil)
             rtn.Tokens = make([]string, wordc)
             rtn.Vocab = make(map[string]int, wordc)
             return nil
-		},
-		Embed: func(t string, v []float32) error {
+        },
+        Embed: func(t string, v []float32) error {
             rtn.Tokens[i] = t
             rtn.Vocab[t] = i
             l := make([]float64, len(v))
@@ -59,10 +60,10 @@ func readEmbeddings(path string) (rtn embeddings, err error) {
                 l[j] = float64(v[j])
             }
             rtn.SetRow(i, l)
-			i++
+            i++
             return nil
-		},
-	}
+        },
+    }
     if len(path) >= 4 && path[len(path)-4:] == ".bin" {
         err = embedder.EmbedBin(istrm)
     } else {
@@ -72,7 +73,7 @@ func readEmbeddings(path string) (rtn embeddings, err error) {
 }
 
 func (eb embeddings) placeholder() (rtn mat.Vector) {
-    k, _ := eb.Dims()
+    _, k := eb.Dims()
     s := 1 / float64(k)
     v := mat.NewVecDense(k, make([]float64, k))
     rtn = v
@@ -106,16 +107,16 @@ func regress(X mat.Matrix, Y mat.Matrix) *mat.Dense {
     return V
 }
 
-type Window []prose.Token
+type window []prose.Token
 
-func (D Window) NGrams(n int, forEach func(Window)) {
+func (D window) nGrams(n int, forEach func(window)) {
     k := len(D) - n + 1
     for i := 0; i < k; i++ {
-        forEach(D[i:i+n])
+        forEach(D[i : i+n])
     }
 }
 
-func coocs(corpus io.Reader, eb embeddings, n int) (J mat.Matrix, F mat.Vector, err error) {
+func coocs(corpus io.Reader, eb embeddings, n int, placeholder mat.Vector) (J mat.Matrix, F mat.Vector, err error) {
     v, _ := eb.Dims()
     juxt := sparse.NewDOK(v, v)
     freqs := make([]float64, v)
@@ -124,15 +125,17 @@ func coocs(corpus io.Reader, eb embeddings, n int) (J mat.Matrix, F mat.Vector, 
         if err != nil {
             return err
         }
-        Window(D.Tokens()).NGrams(n, func(ctx Window) {
+        window(D.Tokens()).nGrams(n, func(ctx window) {
             incr := 1 / float64(n)
             for _, t := range ctx {
-                if i, ok := eb.Vocab[t.Text]; ok {
-                    freqs[i] += incr
-                    for _, w := range ctx {
-                        if j, ok := eb.Vocab[w.Text]; ok {
-                            juxt.Set(i, j, juxt.At(i, j) + incr)
-                        }
+                i, ok := eb.Vocab[t.Text]
+                if !ok {
+                    continue
+                }
+                freqs[i] += incr
+                for _, w := range ctx {
+                    if j, ok := eb.Vocab[w.Text]; ok {
+                        juxt.Set(i, j, juxt.At(i, j)+incr)
                     }
                 }
             }
@@ -146,20 +149,40 @@ func coocs(corpus io.Reader, eb embeddings, n int) (J mat.Matrix, F mat.Vector, 
     return
 }
 
-func readCorpus(istrm io.Reader, forEach func(string) error) error {
+func readCorpus(istrm io.Reader, forEach func(string) error) (err error) {
     var (
-        doc string
+        paragraph string
         err error
     )
-    for ; err != nil; _, err = fmt.Fscanf(istrm, "%s\n\n", &doc) {
-        if err = forEach(doc); err != nil {
-            return err
+    rd := bufio.NewReader(istrm)
+    buf := strings.Builder{}
+    defer func() {
+        r := recover(); if r != nil {
+            switch r.(type) {
+            case error:
+                err = r.(error)
+            }
+        }
+    }()
+    for ; err == nil; paragraph, err = rd.ReadString('\n') {
+        paragraph = strings.TrimSpace(paragraph)
+        if paragraph == "" {
+            go func() {
+                err := forEach(buf.String())
+                if err != nil {
+                    panic(err)
+                }
+            }()
+            buf.Reset()
+        } else {
+            buf.WriteString(paragraph)
+            buf.WriteByte('\n')
         }
     }
     if err == io.EOF {
         err = nil
     }
-    return err
+    return
 }
 
 // https://github.com/NLPrinceton/ALaCarte/blob/master/compute.py
@@ -206,11 +229,12 @@ func main() {
     if err != nil {
         panic(err)
     }
-    istrm, err := os.Open(corpusPath)
+    corpus, err := os.Open(corpusPath)
     if err != nil {
         panic(err)
     }
-    J, F, err := coocs(istrm, eb, windowSize)
+    placeholder := eb.placeholder()
+    J, F, err := coocs(corpus, eb, windowSize, placeholder)
     if err != nil {
         panic(err)
     }
@@ -222,18 +246,17 @@ func main() {
     if err = persist(ostrm, A); err != nil {
         panic(err)
     }
-    if _, err = istrm.Seek(0, io.SeekStart); err != nil {
+    if _, err = corpus.Seek(0, io.SeekStart); err != nil {
         panic(err)
     }
-    placeholder := eb.placeholder()
     samples := make([]float64, 0, 1024)
-    err = readCorpus(istrm, func(src string) error {
+    err = readCorpus(corpus, func(src string) error {
         doc, err := prose.NewDocument(strings.ToLower(src))
         if err != nil {
             return err
         }
-        Window(doc.Tokens()).NGrams(windowSize, func(ctx Window) {
-            v := eb.embed(ctx[len(ctx) / 2].Text)
+        window(doc.Tokens()).nGrams(windowSize, func(ctx window) {
+            v := eb.embed(ctx[len(ctx)/2].Text)
             if v == nil {
                 return
             }
@@ -263,7 +286,7 @@ func main() {
     var sigma float64
     for _, x := range samples {
         r := median - x
-        sigma += r*r
+        sigma += r * r
     }
     sigma = math.Sqrt(sigma)
     fmt.Printf("μ = %f; σ = %f\n", median, sigma)
