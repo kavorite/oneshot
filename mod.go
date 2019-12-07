@@ -4,17 +4,20 @@ import (
     "encoding/binary"
     "flag"
     "fmt"
+    "unicode"
     "io"
     "math"
     "os"
     "sort"
     "strings"
     "bufio"
+    "sync"
+    "golang.org/x/text/transform"
+    "golang.org/x/text/unicode/norm"
 
     "github.com/james-bowman/sparse"
     "github.com/kavorite/induction/word2vec"
     "gonum.org/v1/gonum/mat"
-    "gopkg.in/jdkato/prose.v2"
 )
 
 var (
@@ -24,6 +27,22 @@ var (
 
 func cos(u, v mat.Vector) float64 {
     return mat.Dot(u, v) / mat.Norm(u, 2) / mat.Norm(v, 2)
+}
+
+func pbar(task string) func(float64) {
+    const width = 24
+    return func(x float64) {
+        bar := "["
+        n := int(x * width)
+        for i := 1; i <= n; i++ {
+            bar += "#"
+        }
+        for i := 1; i <= width-n; i++ {
+            bar += " "
+        }
+        bar += "]"
+        fmt.Printf("%s: %s %.2f%%\r", task, bar, x*100)
+    }
 }
 
 type embeddings struct {
@@ -39,11 +58,15 @@ func (eb embeddings) embed(t string) (v mat.Vector) {
     return
 }
 
-func readEmbeddings(path string) (rtn embeddings, err error) {
-    istrm, err := os.Open(path)
+func loadEmbeddings(istrm io.ReadSeeker, binary bool, progress func(float64)) (rtn embeddings, err error) {
+    strmLength, err := istrm.Seek(0, io.SeekEnd)
     if err != nil {
         return
     }
+    if _, err = istrm.Seek(0, io.SeekStart); err != nil {
+        return
+    }
+    bytesRead := int64(0)
     i := 0
     embedder := word2vec.Embedder{
         Head: func(wordc, dimen int) error {
@@ -61,13 +84,24 @@ func readEmbeddings(path string) (rtn embeddings, err error) {
             }
             rtn.SetRow(i, l)
             i++
+            if progress != nil {
+                if bytesRead, err = istrm.Seek(0, io.SeekCurrent); err != nil {
+                    return err
+                }
+                if progress != nil {
+                    progress(float64(bytesRead) / float64(strmLength))
+                }
+            }
             return nil
         },
     }
-    if len(path) >= 4 && path[len(path)-4:] == ".bin" {
+    if binary {
         err = embedder.EmbedBin(istrm)
     } else {
         err = embedder.EmbedText(istrm)
+    }
+    if err == io.EOF {
+        err = nil
     }
     return
 }
@@ -85,11 +119,121 @@ func (eb embeddings) placeholder() (rtn mat.Vector) {
     return
 }
 
+func coocs(documents corpus, eb embeddings, n int, placeholder mat.Vector, progress func(float64)) (J mat.Matrix, F mat.Vector) {
+    v, _ := eb.Dims()
+    juxt := sparse.NewDOK(v, v)
+    freqs := make([]float64, v)
+
+    for i, doc := range documents {
+        if progress != nil {
+            progress(float64(i) / float64(len(documents)-1))
+        }
+        doc.nGrams(n, func(ctx document) {
+            incr := 1 / float64(n)
+            for _, t := range ctx {
+                i, ok := eb.Vocab[t]
+                if !ok {
+                    continue
+                }
+                freqs[i] += incr
+                for _, w := range ctx {
+                    if j, ok := eb.Vocab[w]; ok {
+                        juxt.Set(i, j, juxt.At(i, j)+incr)
+                    }
+                }
+            }
+        })
+    }
+    J = juxt
+    F = mat.NewVecDense(v, freqs)
+    return
+}
+
+type document []string
+
+type corpus []document
+
+func strip(src string) string {
+    strip := func(r rune) bool {
+        return unicode.Is(unicode.Mn, r)
+    }
+    t := transform.Chain(norm.NFD, transform.RemoveFunc(strip), norm.NFC)
+    stripped, _, _ := transform.String(t, src)
+    return strings.ToLower(stripped)
+}
+
+func tokenize(src string) document {
+    return document(strings.Fields(strip(src)))
+}
+
+func (doc document) nGrams(n int, forEach func(document)) {
+    k := len(doc) - n + 1
+    for i := 0; i < k; i++ {
+        forEach(doc[i : i+n])
+    }
+}
+
+func loadCorpus(istrm io.ReadSeeker, progress func(float64)) (C corpus, err error) {
+    strmLength, err := istrm.Seek(0, io.SeekEnd)
+    bytesRead := int64(0)
+    if err != nil {
+        return
+    }
+    if _, err = istrm.Seek(0, io.SeekStart); err != nil {
+        return
+    }
+    rd := bufio.NewReader(istrm)
+    paragraph := ""
+    buf := strings.Builder{}
+    srcs := make(chan string)
+    sink := make(chan document)
+    var wg sync.WaitGroup
+    wg.Add(4)
+    for i := 1; i <= 4; i++ {
+        go func() {
+            defer wg.Done()
+            for s := range srcs {
+                sink <- tokenize(s)
+            }
+        }()
+    }
+    go func() {
+        for doc := range sink {
+            C = append(C, doc)
+        }
+    }()
+    for ; err == nil; paragraph, err = rd.ReadString('\n') {
+        paragraph = strings.TrimSpace(paragraph)
+        if paragraph == "" {
+            srcs <- buf.String()
+            if progress != nil {
+                if bytesRead, err = istrm.Seek(0, io.SeekCurrent); err != nil {
+                    return
+                }
+                if progress != nil {
+                    progress(float64(bytesRead) / float64(strmLength))
+                }
+            }
+            buf.Reset()
+        } else {
+            buf.WriteString(paragraph)
+            buf.WriteByte('\n')
+        }
+    }
+    close(srcs)
+    wg.Wait()
+    close(sink)
+    if err == io.EOF {
+        err = nil
+    }
+    return
+}
+
 // linear regression
 // http://cowlet.org/2016/08/23/linear-regression-in-rust.html
 func regress(X mat.Matrix, Y mat.Matrix) *mat.Dense {
     svd := new(mat.SVD)
-    svd.Factorize(X, mat.SVDThin)
+    svd.Factorize(X, mat.SVDFull)
     U := new(mat.Dense)
     V := new(mat.Dense)
     A := new(mat.Dense)
@@ -102,87 +246,9 @@ func regress(X mat.Matrix, Y mat.Matrix) *mat.Dense {
     for i := 0; i < orderp1; i++ {
         raw[i] = A.At(i, 0) / s[i]
     }
-    sInvA := mat.NewDense(orderp1, 1, raw)
+    sInvA := mat.NewVecDense(orderp1, raw)
     V.Mul(V, sInvA)
     return V
-}
-
-type window []prose.Token
-
-func (D window) nGrams(n int, forEach func(window)) {
-    k := len(D) - n + 1
-    for i := 0; i < k; i++ {
-        forEach(D[i : i+n])
-    }
-}
-
-func coocs(corpus io.Reader, eb embeddings, n int, placeholder mat.Vector) (J mat.Matrix, F mat.Vector, err error) {
-    v, _ := eb.Dims()
-    juxt := sparse.NewDOK(v, v)
-    freqs := make([]float64, v)
-    err = readCorpus(corpus, func(src string) error {
-        D, err := prose.NewDocument(src)
-        if err != nil {
-            return err
-        }
-        window(D.Tokens()).nGrams(n, func(ctx window) {
-            incr := 1 / float64(n)
-            for _, t := range ctx {
-                i, ok := eb.Vocab[t.Text]
-                if !ok {
-                    continue
-                }
-                freqs[i] += incr
-                for _, w := range ctx {
-                    if j, ok := eb.Vocab[w.Text]; ok {
-                        juxt.Set(i, j, juxt.At(i, j)+incr)
-                    }
-                }
-            }
-        })
-        return nil
-    })
-    if err == nil {
-        J = juxt
-        F = mat.NewVecDense(v, freqs)
-    }
-    return
-}
-
-func readCorpus(istrm io.Reader, forEach func(string) error) (err error) {
-    var (
-        paragraph string
-        err error
-    )
-    rd := bufio.NewReader(istrm)
-    buf := strings.Builder{}
-    defer func() {
-        r := recover(); if r != nil {
-            switch r.(type) {
-            case error:
-                err = r.(error)
-            }
-        }
-    }()
-    for ; err == nil; paragraph, err = rd.ReadString('\n') {
-        paragraph = strings.TrimSpace(paragraph)
-        if paragraph == "" {
-            go func() {
-                err := forEach(buf.String())
-                if err != nil {
-                    panic(err)
-                }
-            }()
-            buf.Reset()
-        } else {
-            buf.WriteString(paragraph)
-            buf.WriteByte('\n')
-        }
-    }
-    if err == io.EOF {
-        err = nil
-    }
-    return
 }
 
 // https://github.com/NLPrinceton/ALaCarte/blob/master/compute.py
@@ -190,11 +256,19 @@ func readCorpus(istrm io.Reader, forEach func(string) error) (err error) {
 // embeddings: V × d
 // wordFreqs: 1 × V
 // weights: 1 × V (optional)
-func induce(wordCoocs mat.Matrix, eb mat.Matrix, wordFreqs mat.Vector) *mat.Dense {
+func induce(coocs mat.Matrix, eb mat.Matrix, wordFreqs, weights mat.Vector) *mat.Dense {
     v, d := eb.Dims()
     A := mat.NewDense(v, d, make([]float64, v*d))
-    A.Mul(wordCoocs, eb)
-    A.DivElem(A, wordFreqs)
+    A.Mul(coocs , eb)
+    for k := 0; k < v - 1; k++ {
+        row := A.RawRowView(k)
+        for i := range row {
+            row[i] /= wordFreqs.AtVec(k)
+            if weights != nil {
+                row[i] *= weights.AtVec(k)
+            }
+        }
+    }
     return regress(A, eb)
 }
 
@@ -225,38 +299,42 @@ func main() {
         fmt.Fprintf(os.Stderr, "please provide -embeddings\n")
         os.Exit(2)
     }
-    eb, err := readEmbeddings(embeddingPath)
+    istrm, err := os.Open(embeddingPath)
     if err != nil {
         panic(err)
     }
-    corpus, err := os.Open(corpusPath)
+    binary := false
+    if len(embeddingPath) >= 4 && embeddingPath[len(embeddingPath)-4:] == ".bin" {
+        binary = true
+    }
+    eb, err := loadEmbeddings(istrm, binary, pbar("Load embeddings"))
+    fmt.Println()
     if err != nil {
         panic(err)
     }
+    istrm, err = os.Open(corpusPath)
+    if err != nil {
+        panic(err)
+    }
+    corpus, err := loadCorpus(istrm, pbar("Load corpus"))
+    fmt.Println()
     placeholder := eb.placeholder()
-    J, F, err := coocs(corpus, eb, windowSize, placeholder)
-    if err != nil {
-        panic(err)
-    }
+    J, F := coocs(corpus, eb, windowSize, placeholder, pbar("Evaluate cooccurrences"))
+    fmt.Println()
     ostrm, err := os.OpenFile(opath, os.O_CREATE|os.O_WRONLY, 0666)
     if err != nil {
         panic(err)
     }
-    A := induce(J, eb, F)
+    fmt.Println("Learn induction matrix...")
+    A := induce(J, eb, F, nil)
+    fmt.Printf("Persist induction matrix (%s)...\n", opath)
     if err = persist(ostrm, A); err != nil {
         panic(err)
     }
-    if _, err = corpus.Seek(0, io.SeekStart); err != nil {
-        panic(err)
-    }
     samples := make([]float64, 0, 1024)
-    err = readCorpus(corpus, func(src string) error {
-        doc, err := prose.NewDocument(strings.ToLower(src))
-        if err != nil {
-            return err
-        }
-        window(doc.Tokens()).nGrams(windowSize, func(ctx window) {
-            v := eb.embed(ctx[len(ctx)/2].Text)
+    for i, doc := range corpus {
+        doc.nGrams(windowSize, func(ctx document) {
+            v := eb.embed(ctx[len(ctx)/2])
             if v == nil {
                 return
             }
@@ -264,7 +342,7 @@ func main() {
             vAvg := mat.NewVecDense(d, make([]float64, d))
             s := 1 / float64(len(ctx))
             for _, t := range ctx {
-                v := eb.embed(t.Text)
+                v := eb.embed(t)
                 if v == nil {
                     v = placeholder
                 }
@@ -273,11 +351,8 @@ func main() {
             vHat := mat.NewDense(1, d, make([]float64, d))
             vHat.Mul(A, vAvg.T())
             samples = append(samples, cos(vHat.RowView(0), v))
+            fmt.Printf("Evaluate induced embeddings: %.2f%%\r", float64(i) / float64(len(corpus)-1))
         })
-        return nil
-    })
-    if err != nil {
-        panic(err)
     }
     sort.Slice(samples, func(i, j int) bool {
         return samples[i] < samples[j]
