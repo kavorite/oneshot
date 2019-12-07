@@ -16,7 +16,7 @@ func (cfg Embedder) EmbedBin(istrm io.Reader) (err error) {
 		wordc, dimen int
 		t            string
 	)
-	_, err = fmt.Fscanf(istrm, "%d %d", &wordc, &dimen)
+	_, err = fmt.Fscanf(istrm, "%d %d\n", &wordc, &dimen)
 	if err != nil {
 		return
 	}

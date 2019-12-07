@@ -32,16 +32,18 @@ func cos(u, v mat.Vector) float64 {
 func pbar(task string) func(float64) {
     const width = 24
     return func(x float64) {
-        bar := "["
+        var bar strings.Builder
+        bar.Grow(width + 2)
+        bar.WriteByte('[')
         n := int(x * width)
         for i := 1; i <= n; i++ {
-            bar += "#"
+            bar.WriteByte('#')
         }
         for i := 1; i <= width-n; i++ {
-            bar += " "
+            bar.WriteByte(' ')
         }
-        bar += "]"
-        fmt.Printf("%s: %s %.2f%%\r", task, bar, x*100)
+        bar.WriteByte(']')
+        fmt.Printf("%s: %s %.2f%%\r", task, bar.String(), x*100)
     }
 }
 
@@ -229,16 +231,13 @@ func loadCorpus(istrm io.ReadSeeker, progress func(float64)) (C corpus, err erro
     return
 }
 
-// linear regression
 // http://cowlet.org/2016/08/23/linear-regression-in-rust.html
-func regress(X mat.Matrix, Y mat.Matrix) *mat.Dense {
-    svd := new(mat.SVD)
+func linearRegression(X, Y mat.Matrix) *mat.Dense {
+    var svd mat.SVD
     svd.Factorize(X, mat.SVDFull)
-    U := new(mat.Dense)
-    V := new(mat.Dense)
-    A := new(mat.Dense)
-    svd.UTo(U)
-    svd.VTo(V)
+    var U, V, A mat.Dense
+    svd.UTo(&U)
+    svd.VTo(&V)
     A.Mul(U.T(), Y)
     _, orderp1 := X.Dims()
     s := svd.Values(nil)[:orderp1]
@@ -247,8 +246,8 @@ func regress(X mat.Matrix, Y mat.Matrix) *mat.Dense {
         raw[i] = A.At(i, 0) / s[i]
     }
     sInvA := mat.NewVecDense(orderp1, raw)
-    V.Mul(V, sInvA)
-    return V
+    V.Mul(&V, sInvA)
+    return &V
 }
 
 // https://github.com/NLPrinceton/ALaCarte/blob/master/compute.py
@@ -256,30 +255,52 @@ func regress(X mat.Matrix, Y mat.Matrix) *mat.Dense {
 // embeddings: V × d
 // wordFreqs: 1 × V
 // weights: 1 × V (optional)
-func induce(coocs mat.Matrix, eb mat.Matrix, wordFreqs, weights mat.Vector) *mat.Dense {
+func computeTransform(coocs, eb mat.Matrix, wordFreqs, wordWeights mat.Vector) *mat.Dense {
     v, d := eb.Dims()
-    A := mat.NewDense(v, d, make([]float64, v*d))
-    A.Mul(coocs , eb)
+    var selection mask
+    selection.resize(v)
+    for t := 0; t < wordFreqs.Len() - 1; t++ {
+        x := wordFreqs.AtVec(t)
+        if wordWeights != nil {
+            x *= wordWeights.AtVec(t)
+        }
+        selection.set(t, x > 0)
+    }
+    J := sparse.NewDOK(selection.length, selection.length)
+    V := mat.NewDense(selection.length, d,
+        make([]float64, selection.length * d))
+    for i := 0; i < selection.length-1; i++ {
+        if selection.get(i) {
+            for j := 0; j < d-1; j++ {
+                V.Set(i, j, eb.At(i, j))
+                J.Set(i, j, coocs.At(i, j))
+            }
+        }
+    }
+    var A mat.Dense
+    A.Mul(J, V)
     for k := 0; k < v - 1; k++ {
         row := A.RawRowView(k)
         for i := range row {
             row[i] /= wordFreqs.AtVec(k)
-            if weights != nil {
-                row[i] *= weights.AtVec(k)
+            if wordWeights != nil {
+                row[i] *= wordWeights.AtVec(k)
             }
         }
     }
-    return regress(A, eb)
+    return linearRegression(&A, eb)
 }
 
-func persist(ostrm io.Writer, A *mat.Dense) (err error) {
+func persistTransform(ostrm io.Writer, A mat.Matrix) (err error) {
     m, n := A.Dims()
-    if _, err = fmt.Fprintf(ostrm, "%dx%d\n", m, n); err != nil {
+    if _, err = fmt.Fprintf(ostrm, "%d %d\n", m, n); err != nil {
         return
     }
     for i := 0; i < m-1; i++ {
-        if err = binary.Write(ostrm, binary.LittleEndian, A.RawRowView(i)); err != nil {
-            return
+        for j := 0; j < n-1; j++ {
+            if err = binary.Write(ostrm, binary.LittleEndian, A.At(i, j)); err != nil {
+                return
+            }
         }
     }
     return
@@ -325,13 +346,14 @@ func main() {
     if err != nil {
         panic(err)
     }
-    fmt.Println("Learn induction matrix...")
-    A := induce(J, eb, F, nil)
+    fmt.Println("Compute induction matrix...")
+    A := computeTransform(J, eb, F, nil)
     fmt.Printf("Persist induction matrix (%s)...\n", opath)
-    if err = persist(ostrm, A); err != nil {
+    if err = persistTransform(ostrm, A); err != nil {
         panic(err)
     }
     samples := make([]float64, 0, 1024)
+    prnProgress := pbar("Evaluate induced embeddings")
     for i, doc := range corpus {
         doc.nGrams(windowSize, func(ctx document) {
             v := eb.embed(ctx[len(ctx)/2])
@@ -351,7 +373,7 @@ func main() {
             vHat := mat.NewDense(1, d, make([]float64, d))
             vHat.Mul(A, vAvg.T())
             samples = append(samples, cos(vHat.RowView(0), v))
-            fmt.Printf("Evaluate induced embeddings: %.2f%%\r", float64(i) / float64(len(corpus)-1))
+            prnProgress(float64(i) / float64(len(corpus)-1))
         })
     }
     sort.Slice(samples, func(i, j int) bool {
