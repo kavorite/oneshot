@@ -1,13 +1,13 @@
-package main
+package mask
 
 import "github.com/teivah/bitvector"
 
-type mask struct {
+type Mask struct {
     vectors []bitvector.Len64
     length int
 }
 
-func (m *mask) vecAt(i int) *bitvector.Len64 {
+func (m *Mask) VecAt(i int) *bitvector.Len64 {
     vi := i >> 6
     if vi > len(m.vectors)-1 {
         return nil
@@ -15,13 +15,17 @@ func (m *mask) vecAt(i int) *bitvector.Len64 {
     return &m.vectors[vi]
 }
 
-func (m *mask) capacity() int {
+func (m *Mask) Cap() int {
     return len(m.vectors) << 6
 }
 
+func (m *Mask) Len() int {
+    return m.length
+}
+
 // resize to fit at least n elements
-func (m *mask) resize(capacity int) {
-    canFit := m.capacity()
+func (m *Mask) Resize(capacity int) {
+    canFit := m.Cap()
     shouldFit := canFit + capacity
     growElem := shouldFit - canFit
     growVecs := growElem >> 6
@@ -35,21 +39,21 @@ func (m *mask) resize(capacity int) {
     m.vectors = append(m.vectors, make([]bitvector.Len64, growVecs)...)
 }
 
-func (m *mask) get(i int) bool {
-    v := m.vecAt(i)
+func (m *Mask) Get(i int) bool {
+    v := m.VecAt(i)
     if v == nil {
         return false
     }
     return v.Get(uint8(i % 64))
 }
 
-func (m *mask) set(i int, p bool) {
-    v := m.vecAt(i)
+func (m *Mask) Set(i int, p bool) {
+    v := m.VecAt(i)
     if v == nil {
-        m.resize(i+1)
+        m.Resize(i+1)
     }
     if p {
-        *m.vecAt(i) = m.vecAt(i).Set(uint8(i%64), p)
+        *m.VecAt(i) = m.VecAt(i).Set(uint8(i%64), p)
     }
     if i+1 > m.length {
         m.length = i+1

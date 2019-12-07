@@ -16,7 +16,8 @@ import (
     "golang.org/x/text/unicode/norm"
 
     "github.com/james-bowman/sparse"
-    "github.com/kavorite/induction/word2vec"
+    "github.com/kavorite/oneshot/word2vec"
+    "github.com/kavorite/oneshot/mask"
     "gonum.org/v1/gonum/mat"
 )
 
@@ -257,20 +258,20 @@ func linearRegression(X, Y mat.Matrix) *mat.Dense {
 // weights: 1 × V (optional)
 func computeTransform(coocs, eb mat.Matrix, wordFreqs, wordWeights mat.Vector) *mat.Dense {
     v, d := eb.Dims()
-    var selection mask
-    selection.resize(v)
+    var selection mask.Mask
+    selection.Resize(v)
     for t := 0; t < wordFreqs.Len() - 1; t++ {
         x := wordFreqs.AtVec(t)
         if wordWeights != nil {
             x *= wordWeights.AtVec(t)
         }
-        selection.set(t, x > 0)
+        selection.Set(t, x > 0)
     }
-    J := sparse.NewDOK(selection.length, selection.length)
-    V := mat.NewDense(selection.length, d,
-        make([]float64, selection.length * d))
-    for i := 0; i < selection.length-1; i++ {
-        if selection.get(i) {
+    J := sparse.NewDOK(selection.Len(), selection.Len())
+    V := mat.NewDense(selection.Len(), d,
+        make([]float64, selection.Len() * d))
+    for i := 0; i < selection.Len()-1; i++ {
+        if selection.Get(i) {
             for j := 0; j < d-1; j++ {
                 V.Set(i, j, eb.At(i, j))
                 J.Set(i, j, coocs.At(i, j))
